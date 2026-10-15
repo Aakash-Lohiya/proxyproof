@@ -1,0 +1,14 @@
+*.apk
+*.log
+.DS_Store
+firebase/*.log
+firebase/.firebase/
+firebase/firestore-debug.log
+mobile/.env
+mobile/.expo/
+mobile/android/
+mobile/dist/
+mobile/ios/
+node_modules/
+server/data/
+x/

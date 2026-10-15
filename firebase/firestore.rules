@@ -1,0 +1,169 @@
+rules_version = '2';
+
+// ProxyProof security rules.
+//
+// Roles come from the sign-in email domain, never from client data:
+//   *@vitstudent.ac.in -> student      *@vit.ac.in -> organiser
+//
+// Anti-proxy invariants enforced here (the organiser's phone verifies the rest):
+//   - a student profile is bound to one deviceId; only organisers can change it
+//   - a mark request must carry the student's bound deviceId, come from an enrolled
+//     student, and arrive before the session ends
+//   - only the session's organiser can write attendance, attempts or close a session
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------------------------------------------------------------- helpers
+    function signedIn() { return request.auth != null; }
+    function uid() { return request.auth.uid; }
+    function email() { return request.auth.token.email.lower(); }
+    function isStudentEmail() { return email().matches('.*@vitstudent\\.ac\\.in'); }
+    function isOrganiserEmail() { return email().matches('.*@vit\\.ac\\.in'); }
+    function roleFromEmail() { return isStudentEmail() ? 'student' : (isOrganiserEmail() ? 'organiser' : 'none'); }
+    function isOrganiser() { return signedIn() && isOrganiserEmail(); }
+    function isStudent() { return signedIn() && isStudentEmail(); }
+    function userDoc(id) { return get(/databases/$(database)/documents/users/$(id)).data; }
+    function boundDevice() { return userDoc(uid()).deviceId; }
+    function session(id) { return get(/databases/$(database)/documents/sessions/$(id)).data; }
+    function isSessionOrganiser(id) { return session(id).organiserId == uid(); }
+    function isSessionStudent(id) { return uid() in session(id).studentIds; }
+    function sessionOpen(id) {
+      let s = session(id);
+      return !('closedAt' in s) || s.closedAt == null;
+    }
+    function sessionLive(id) { return sessionOpen(id) && request.time < session(id).endsAt; }
+    function changedOnly(keys) { return request.resource.data.diff(resource.data).affectedKeys().hasOnly(keys); }
+
+    // ------------------------------------------------------------------ users
+    match /users/{userId} {
+      // Organisers see every profile (rosters, approvals); students only their own.
+      allow get: if signedIn() && (uid() == userId || isOrganiser());
+      allow list: if isOrganiser();
+
+      // Profile is created once by its owner; role must match the email domain;
+      // students must register with a deviceId.
+      allow create: if signedIn() && uid() == userId
+        && roleFromEmail() != 'none'
+        && request.resource.data.role == roleFromEmail()
+        && request.resource.data.email == email()
+        && request.resource.data.name is string && request.resource.data.name.size() > 0
+        && (request.resource.data.role == 'organiser'
+            || (request.resource.data.deviceId is string && request.resource.data.deviceId.size() > 0));
+
+      // Owners may edit cosmetic fields only. Organisers may move a student's device
+      // binding (approving a device-switch request).
+      allow update: if signedIn() && (
+        (uid() == userId && changedOnly(['name', 'studentCode']))
+        // first sign-in on a student account that has no device yet
+        || (uid() == userId && resource.data.role == 'student' && resource.data.deviceId == null
+            && changedOnly(['deviceId', 'deviceName'])
+            && request.resource.data.deviceId is string && request.resource.data.deviceId.size() > 0)
+        || (isOrganiser() && resource.data.role == 'student' && changedOnly(['deviceId', 'deviceName']))
+      );
+      allow delete: if false;
+    }
+
+    // --------------------------------------------------------- deviceRequests
+    match /deviceRequests/{requestId} {
+      allow read: if isOrganiser() || (signedIn() && resource.data.userId == uid());
+      allow create: if isStudent()
+        && request.resource.data.userId == uid()
+        && request.resource.data.status == 'pending'
+        && request.resource.data.newDeviceId is string && request.resource.data.newDeviceId.size() > 0;
+      allow update: if isOrganiser() && resource.data.status == 'pending'
+        && request.resource.data.status in ['approved', 'rejected']
+        && changedOnly(['status', 'resolvedAt', 'resolvedBy']);
+      allow delete: if false;
+    }
+
+    // ---------------------------------------------------------------- courses
+    match /courses/{courseId} {
+      allow get: if signedIn() && (resource.data.organiserId == uid() || uid() in resource.data.studentIds);
+      // Organisers list their own courses; students list courses they belong to
+      // (queries must include the matching where-clause).
+      allow list: if signedIn() && (resource.data.organiserId == uid() || uid() in resource.data.studentIds);
+      allow create: if isOrganiser()
+        && request.resource.data.organiserId == uid()
+        && request.resource.data.studentIds == []
+        && request.resource.data.code is string && request.resource.data.code.size() == 6;
+      allow update: if signedIn() && (
+        // organiser manages name and roster
+        (resource.data.organiserId == uid() && changedOnly(['name', 'studentIds', 'roster', 'sessionCount']))
+        // a student may add exactly themselves (join by code)
+        || (isStudent()
+            && changedOnly(['studentIds', 'roster'])
+            && !(uid() in resource.data.studentIds)
+            && request.resource.data.studentIds.hasAll(resource.data.studentIds)
+            && request.resource.data.studentIds.size() == resource.data.studentIds.size() + 1
+            && uid() in request.resource.data.studentIds
+            && request.resource.data.roster.diff(resource.data.roster).affectedKeys().hasOnly([uid()]))
+      );
+      allow delete: if false;
+    }
+
+    // Join codes are public to signed-in users so students can look a course up.
+    match /joinCodes/{code} {
+      allow get: if signedIn();
+      allow list: if false;
+      allow create: if isOrganiser() && request.resource.data.organiserId == uid();
+      allow update, delete: if false;
+    }
+
+    // --------------------------------------------------------------- sessions
+    // Document id == BLE shortId, so a student can look a beacon up with a single get.
+    match /sessions/{sessionId} {
+      allow get: if signedIn() && (resource.data.organiserId == uid() || uid() in resource.data.studentIds);
+      allow list: if signedIn() && (resource.data.organiserId == uid() || uid() in resource.data.studentIds);
+      allow create: if isOrganiser()
+        && request.resource.data.organiserId == uid()
+        && request.resource.data.closedAt == null
+        && request.resource.data.endsAt is timestamp
+        && request.resource.data.studentIds is list
+        && get(/databases/$(database)/documents/courses/$(request.resource.data.courseId)).data.organiserId == uid();
+      // Organiser closes the session, keeps a presence counter and may publish a demo token.
+      allow update: if signedIn() && resource.data.organiserId == uid()
+        && changedOnly(['closedAt', 'presentCount', 'demoToken', 'demoTokenAt']);
+      allow delete: if false;
+
+      // Only the organiser may read the broadcasting secret. The secret is written in the
+      // same batch that creates the session, so the write rule looks at the post-batch state.
+      match /private/{doc} {
+        allow read: if signedIn() && isSessionOrganiser(sessionId);
+        allow write: if signedIn()
+          && getAfter(/databases/$(database)/documents/sessions/$(sessionId)).data.organiserId == uid();
+      }
+
+      // A student asks to be marked. The organiser's phone verifies the token/RSSI
+      // and either writes attendance or rejects the request.
+      match /requests/{studentId} {
+        allow get: if signedIn() && (uid() == studentId || isSessionOrganiser(sessionId));
+        allow list: if signedIn() && isSessionOrganiser(sessionId);
+        allow create, update: if signedIn() && (
+          (uid() == studentId
+            && isStudent()
+            && isSessionStudent(sessionId)
+            && sessionLive(sessionId)
+            && request.resource.data.userId == uid()
+            && request.resource.data.deviceId == boundDevice()
+            && request.resource.data.token is string
+            && request.resource.data.rssi is number
+            && request.resource.data.status == 'pending')
+          || (isSessionOrganiser(sessionId) && changedOnly(['status', 'reason', 'resolvedAt']))
+        );
+        allow delete: if false;
+      }
+
+      match /attendance/{studentId} {
+        allow get: if signedIn() && (uid() == studentId || isSessionOrganiser(sessionId));
+        allow list: if signedIn() && isSessionOrganiser(sessionId);
+        allow create, delete: if signedIn() && isSessionOrganiser(sessionId);
+        allow update: if false;
+      }
+
+      match /attempts/{attemptId} {
+        allow read, create: if signedIn() && isSessionOrganiser(sessionId);
+        allow update, delete: if false;
+      }
+    }
+  }
+}
